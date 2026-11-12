@@ -1,0 +1,15 @@
+.databricks/
+target/
+dbt_packages/
+logs/
+__pycache__/
+*.pyc
+.env
+
+# Reinstallable dependencies
+node_modules/
+.terraform/
+
+# Scaled-load runtime state
+src/app/static/rt_state.json
+src/app/static/*.tmp

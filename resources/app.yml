@@ -1,0 +1,54 @@
+resources:
+  apps:
+    lakehouse_rt_demo:
+      name: lakehouse-rt-demo
+      description: "Lakehouse RT Demo: DBSQL Serverless vs Lakehouse//RT, head to head and under scaled load."
+      source_code_path: ../src/app
+      # LARGE: the scaled-load driver runs inside the app and offers up to
+      # 1,200 q/s from one asyncio loop.
+      compute_size: LARGE
+
+      resources:
+        - name: dbsql_warehouse
+          description: DBSQL Serverless warehouse, the comparison engine.
+          sql_warehouse:
+            id: ${var.dbsql_warehouse_id}
+            permission: CAN_USE
+        - name: rt_warehouse
+          description: Lakehouse//RT warehouse. Read path only.
+          sql_warehouse:
+            id: ${var.rt_warehouse_id}
+            permission: CAN_USE
+
+      # Replaces app.yaml, so catalog and schema come from bundle variables.
+      config:
+        # The Python supervisor prewarms both warehouses, starts Streamlit on
+        # DATABRICKS_APP_PORT, runs keepalives and forwards shutdown signals.
+        command: ["python", "warehouse_keeper.py", "--serve"]
+        env:
+          # The proxy origin (*.databricksapps.com) differs from the workspace
+          # origin, which trips Streamlit's CORS and XSRF checks.
+          - name: STREAMLIT_SERVER_ENABLE_CORS
+            value: "false"
+          - name: STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION
+            value: "false"
+          - name: STREAMLIT_BROWSER_GATHER_USAGE_STATS
+            value: "false"
+          - name: DBSQL_WAREHOUSE_ID
+            value_from: dbsql_warehouse
+          - name: RT_WAREHOUSE_ID
+            value_from: rt_warehouse
+          - name: DEMO_CATALOG
+            value: ${var.catalog}
+          - name: DEMO_SCHEMA
+            value: ${var.schema}
+          # The keeper warms both engines before Streamlit serves and touches
+          # them below their auto-stop intervals, so both warehouses stay
+          # running (and billable) while the app is running.
+          - name: WAREHOUSES_PREWARMED
+            value: "true"
+          - name: WAREHOUSE_KEEPALIVE_SECONDS
+            value: "180"
+          # Scaled-load refresh. 10 s: 1,000 users offer 400 q/s.
+          - name: RT_SCALE_REFRESH_S
+            value: "10"

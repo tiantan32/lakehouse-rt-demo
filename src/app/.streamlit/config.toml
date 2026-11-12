@@ -1,0 +1,15 @@
+# Dark "ops console" theme, matching the Lakehouse//RT demo app's serving views.
+[theme]
+base = "dark"
+primaryColor = "#3FE0A0"
+backgroundColor = "#0B0E14"
+secondaryBackgroundColor = "#131822"
+textColor = "#E6EDF6"
+font = "sans serif"
+
+[server]
+# Serves src/app/static/ at /app/static/. The scaled-load frontend is a static
+# page embedded as a same-origin iframe, and it polls static/rt_state.json.
+enableStaticServing = true
+enableCORS = false
+enableXsrfProtection = false

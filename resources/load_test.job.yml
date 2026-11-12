@@ -1,0 +1,32 @@
+# Optional. The Scaled load workload, run from a serverless job instead of the
+# app: 8 processes, each an asyncio loop over 4 HTTP/2 connections. Comparing it
+# with the app at the same user count tells app limits from warehouse limits.
+resources:
+  jobs:
+    load_test:
+      name: "[lakehouse-rt-demo] Lakehouse//RT load test"
+      tags:
+        demo: lakehouse-rt-demo
+      parameters:
+        - name: steps
+          # users:seconds per step. Hold each step at least 3 minutes.
+          default: "1000:180,2000:180"
+      tasks:
+        - task_key: load_test
+          spark_python_task:
+            python_file: ../perf/rt_scale_job.py
+            parameters:
+              - ${workspace.file_path}/src/app
+              - ${var.rt_warehouse_id}
+              - "{{job.parameters.steps}}"
+              - "8"         # worker processes
+              - "10"        # refresh seconds
+              - ${var.catalog}
+              - ${var.schema}
+          environment_key: default
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "5"
+            dependencies:
+              - httpx[http2]>=0.27,<0.29

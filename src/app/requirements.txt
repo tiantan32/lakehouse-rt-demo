@@ -1,0 +1,21 @@
+# Pin to the versions the Databricks Apps base image already ships, so pip
+# installs NOTHING and the app runs on the image's known-good stack.
+#
+# Do not float streamlit. `streamlit>=1.40.0` resolved to 1.63.0, which pulled
+# starlette 1.6.0, broke the image's fastapi 0.115.0
+# ("fastapi 0.115.0 requires starlette<0.39.0,>=0.37.2"), and left the app
+# reporting "Uvicorn server started on 0.0.0.0:8080" while the Apps proxy got
+# 502 Bad Gateway on every request. Platform status stayed compute=ACTIVE /
+# app=RUNNING throughout, so the failure is only visible over HTTP.
+streamlit==1.38.0
+databricks-sdk>=0.33.0
+pandas>=2.1,<3
+# Lakehouse RT's optimized Statement Execution path. The kernel extra supplies
+# the Rust client used by the persistent query pools in kernel_driver.py.
+databricks-sql-connector[kernel]==4.3.0
+# Async HTTP for the scaled-load driver. One asyncio loop over the Statement
+# Execution API replaces the thread pool: OS threads got SLOWER as they widened
+# (213 q/s at 32 threads down to 50 q/s at 128) because the GIL plus per-thread
+# TLS work costs more than the queries do. Reyden refuses Thrift, so every
+# statement is one HTTPS round trip and connection reuse is the only lever.
+httpx[http2]>=0.27,<0.29

@@ -1,0 +1,46 @@
+# Lakehouse RT Demo: DBSQL Serverless vs Lakehouse//RT on one copy of the data.
+#
+#   data      : one serverless job writes three synthetic gold tables (no pipeline)
+#   app       : Databricks App with three views: Architecture, Head to head, Scaled load
+#   load test : optional serverless job, same workload as Scaled load, run outside the app
+#
+# Set the four variables for your workspace, either with --var on every command
+# or once in .databricks/bundle/<target>/variable-overrides.json (see README).
+
+bundle:
+  name: lakehouse-rt-demo
+
+# Runtime state written by the scaled-load driver. Excluded so a local test
+# run's state never ships with the app and briefly shows stale numbers.
+sync:
+  exclude:
+    - src/app/static/rt_state.json
+    - "**/__pycache__/**"
+
+variables:
+  catalog:
+    description: Existing Unity Catalog catalog. The data job creates the schema in it.
+    default: main
+  schema:
+    description: Schema the data job creates for the three gold tables.
+    default: lakehouse_rt_demo
+  dbsql_warehouse_id:
+    description: >-
+      DBSQL Serverless warehouse (PRO). The head-to-head comparison engine.
+      Size it the same as the Lakehouse//RT warehouse for a fair comparison.
+  rt_warehouse_id:
+    description: Lakehouse//RT warehouse. Read path only (it is SELECT-only).
+  n_disputes:
+    description: >-
+      Rows in the case fact and the event stream. 18M gives a ~450 MB optimized
+      fact, which is where the engines separate; small tables hide the difference.
+    default: "18000000"
+
+include:
+  - resources/*.yml
+
+targets:
+  dev:
+    default: true
+    # No `mode: development`: it would prefix the app and job names with the
+    # deploying user, and the app name is part of its URL.

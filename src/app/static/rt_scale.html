@@ -1,0 +1,752 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Lakehouse RT Demo &#x2014; Scaled load</title>
+<style>
+  :root {
+    --bg: #05070b;
+    --card: #0d1117;
+    --card-line: #1b222c;
+    --tile: #131820;
+    --tile-line: #1e2530;
+    --ink: #e6edf3;
+    --ink-dim: #7d8794;
+    --ink-faint: #4a525e;
+    --teal: #4ee0d0;
+    --green: #5be3a7;
+    --amber: #f2c14e;
+    --bar: #39424f;
+    --panel: #0b1220;
+    --panel-line: #1d2942;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--ink);
+    font-family: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    overflow: hidden;
+  }
+  .num { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+
+  /* ---------------- dashboard wall ---------------- */
+  #wall {
+    position: absolute; inset: 0;
+    display: grid; gap: 10px;
+    align-content: start; justify-content: center;
+    padding: 14px;
+    overflow: hidden;
+  }
+  .slot { position: relative; }
+  .card {
+    position: absolute; top: 0; left: 0;
+    width: 560px; height: 360px;
+    transform-origin: top left;
+    background: var(--card);
+    border: 1px solid var(--card-line);
+    border-radius: 10px;
+    overflow: hidden;
+    contain: strict;
+    content-visibility: auto;
+  }
+
+  /* fake databricks chrome */
+  .nav {
+    height: 40px; display: flex; align-items: center; gap: 10px;
+    padding: 0 12px; border-bottom: 1px solid var(--card-line);
+  }
+  .nav .side { width: 15px; height: 13px; border: 1.5px solid #39424f; border-radius: 2px; }
+  .brand { display: flex; align-items: center; gap: 6px; }
+  /* Official Databricks stacked-layers mark, Lava #FF3621. Drawn from a single
+     <symbol> defined once in the document and referenced per card with <use>:
+     inlining the ~600-byte path into every card is ~290 KB of extra payload at
+     500 cards, and the whole wall is re-sent on each repaint. */
+  .brand .mark { width: 15px; height: 16.5px; flex: none; display: block; }
+  .brand span { font-size: 12.5px; font-weight: 600; letter-spacing: .1px; }
+  .search {
+    flex: 1; height: 24px; margin: 0 6px;
+    background: #0b0f15; border: 1px solid var(--card-line); border-radius: 5px;
+    display: flex; align-items: center; gap: 6px; padding: 0 8px;
+    font-size: 10.5px; color: var(--ink-faint);
+  }
+  .search .kbd { margin-left: auto; font-size: 9.5px; letter-spacing: .5px; }
+  .pill-prod {
+    font-size: 9.5px; padding: 2.5px 7px; border-radius: 4px;
+    background: rgba(214,67,152,.13); color: #d966ad;
+  }
+  .avatar {
+    width: 18px; height: 18px; border-radius: 50%;
+    background: #6b46c1; color: #fff;
+    font-size: 10px; line-height: 18px; text-align: center; font-weight: 600;
+  }
+
+  /* widget grid */
+  .tiles {
+    display: grid;
+    /* minmax(0,1fr), not 1fr: a 1fr track's implicit minimum is min-content, so
+       the nowrap captions below would widen the tracks past the card and the
+       right-hand tiles would be clipped. */
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 1px; background: var(--card-line);
+    height: calc(100% - 40px);
+  }
+  .tile {
+    background: var(--card); padding: 13px 15px;
+    display: flex; flex-direction: column; min-width: 0;
+  }
+  .tile-head { display: flex; justify-content: space-between; align-items: baseline; }
+  .tile-label {
+    font-size: 8.5px; letter-spacing: 1.3px; color: var(--ink-dim); font-weight: 500;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
+  }
+  .tile-cur {
+    font-size: 8px; letter-spacing: 1.1px; color: var(--ink-faint);
+    white-space: nowrap; flex: 0 0 auto; padding-left: 8px;
+  }
+  .tile-cap {
+    font-size: 11.5px; color: #c3ccd6; margin-top: 5px;
+    /* One line only: a wrapped caption pushes its chart down and the 2x2 grid
+       stops aligning across tiles. min-width:0 lets it actually ellipsis inside
+       the flex row instead of forcing the row wider. */
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    min-width: 0; flex: 1 1 auto;
+  }
+  .tile-val {
+    font-size: 11.5px; color: #c3ccd6; margin-top: 5px;
+    text-align: right; white-space: nowrap; padding-left: 8px; flex: 0 0 auto;
+  }
+  .tile-val.none { color: var(--ink-faint); }
+  .tile-sub { display: flex; justify-content: space-between; align-items: baseline; }
+  .chart {
+    flex: 1; margin-top: 10px; min-height: 0;
+    background: var(--tile); border: 1px solid var(--tile-line); border-radius: 3px;
+    position: relative; overflow: hidden;
+  }
+  .grid-lines {
+    position: absolute; inset: 0;
+    background-image: repeating-linear-gradient(to bottom, transparent 0 24%, #1b212b 24% calc(24% + 1px));
+  }
+  .bars { position: absolute; inset: 8px 10px; display: flex; align-items: flex-end; gap: 4px; }
+  .bars > b { flex: 1; background: var(--bar); border-radius: 1px 1px 0 0; min-height: 2px; }
+  .chart.tex .grid-lines { display: none; }
+  /* Texture LOD. --texw is set per card in card-space as (target_px / scale) so
+     that after the card's transform the stripes land at ~3.5px on screen; a
+     fixed 3px here collapses into hairlines once scaled by ~0.11. */
+  .chart.tex {
+    --texw: 24px;
+    background-image:
+      repeating-linear-gradient(to right,
+        #333c48 0 var(--texw), transparent var(--texw) calc(var(--texw) * 2.1));
+    background-size: 100% 52%;
+    background-position: left bottom;
+    background-repeat: no-repeat;
+  }
+  .chart svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .chart svg path { fill: none; stroke: #6b7684; stroke-width: 1.6; }
+
+  /* ---------------- control panel ---------------- */
+  #panel {
+    position: absolute; right: 26px; bottom: 26px; width: 664px;
+    background: rgba(11,18,32,.93);
+    border: 1px solid var(--panel-line); border-radius: 12px;
+    backdrop-filter: blur(9px);
+    box-shadow: 0 18px 48px rgba(0,0,0,.62);
+    z-index: 10;
+  }
+  .stats { display: grid; grid-template-columns: 1fr 1fr 1fr; }
+  .stat { padding: 15px 17px; position: relative; }
+  .stat + .stat { border-left: 1px dashed var(--panel-line); }
+  .stat-head { display: flex; align-items: center; gap: 8px; }
+  .tag {
+    font-size: 9.5px; font-weight: 700; letter-spacing: .8px;
+    padding: 2px 6px; border-radius: 4px; border: 1px solid currentColor;
+  }
+  .tag.p50 { color: var(--green); }
+  .tag.p95 { color: var(--amber); }
+  .tag.qps { color: var(--teal); }
+  .stat-title { font-size: 9.5px; letter-spacing: 1.1px; color: #aab4c0; white-space: nowrap; }
+  .stat-cap { font-size: 10.5px; color: var(--ink-dim); margin-top: 5px; }
+  .stat-val { margin-top: 12px; font-size: 27px; font-weight: 600; letter-spacing: -.5px; }
+  .stat-val .u { font-size: 12px; font-weight: 500; color: var(--ink-dim); margin-left: 3px; }
+  .stat-val.idle { color: #2b3341; }
+  .stat-foot { font-size: 9.5px; color: var(--ink-faint); margin-top: 4px; height: 12px; }
+  .ico {
+    position: absolute; top: 13px; right: 15px;
+    width: 25px; height: 25px; border-radius: 5px;
+    background: rgba(78,224,208,.08); color: var(--teal);
+    display: grid; place-items: center; font-size: 12px;
+  }
+  .ico.g { background: rgba(91,227,167,.08); color: var(--green); }
+  .ico.a { background: rgba(242,193,78,.08); color: var(--amber); }
+
+  .users { border-top: 1px dashed var(--panel-line); padding: 15px 17px 17px; position: relative; }
+  .users-title { font-size: 10px; letter-spacing: 1.4px; color: #aab4c0; }
+  .users-cap { font-size: 10.5px; color: var(--ink-dim); margin-top: 4px; }
+  .users-num { font-size: 38px; font-weight: 700; color: var(--teal); letter-spacing: 1px; margin: 6px 0 10px; }
+  .ctl { display: flex; align-items: center; gap: 11px; }
+  .step {
+    width: 27px; height: 25px; border-radius: 5px; flex: none;
+    background: #0e1626; border: 1px solid var(--panel-line); color: #9aa5b2;
+    font-size: 14px; cursor: pointer;
+  }
+  .step:hover { border-color: var(--teal); color: var(--teal); }
+  input[type=range] {
+    flex: 1; -webkit-appearance: none; appearance: none;
+    height: 4px; border-radius: 3px; outline: none; cursor: pointer;
+    background: linear-gradient(to right, var(--teal) 0%, var(--teal) var(--fill,0%), #2c3547 var(--fill,0%), #2c3547 100%);
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 13px; height: 13px; border-radius: 50%;
+    background: var(--teal); box-shadow: 0 0 0 3px rgba(78,224,208,.18);
+  }
+  input[type=range]::-moz-range-thumb {
+    width: 13px; height: 13px; border: none; border-radius: 50%; background: var(--teal);
+  }
+  #go {
+    flex: none; padding: 7px 17px; border-radius: 5px;
+    background: rgba(78,224,208,.09); border: 1px solid var(--teal); color: var(--teal);
+    font-size: 11px; font-weight: 700; letter-spacing: 1.3px; cursor: pointer;
+  }
+  #go:hover { background: rgba(78,224,208,.17); }
+  #go.on { color: var(--amber); border-color: var(--amber); background: rgba(242,193,78,.09); }
+  .ticks { display: flex; justify-content: space-between; margin: 5px 49px 0 38px; }
+  .ticks span { font-size: 9px; color: var(--ink-faint); }
+  #foot {
+    position: absolute; left: 26px; bottom: 26px; z-index: 10;
+    font-size: 10px; color: var(--ink-faint); line-height: 1.65; max-width: 660px;
+  }
+  #foot > div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #foot b { color: var(--ink-dim); font-weight: 500; }
+  #err { color: #e06c6c; }
+</style>
+</head>
+<body>
+<!-- Databricks mark, defined once and referenced by every card's nav via
+     <use href="#db-mark">. Lives outside #wall so layout() rebuilding the wall
+     never destroys it. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><symbol
+  id="db-mark" viewBox="0 0 300 331"><path fill="#FF3621" d="M283.923 136.449L150.144
+  213.624L6.88995 131.168L0 134.982V194.844L150.144 281.115L283.923 204.234V235.926L150.144
+  313.1L6.88995 230.644L0 234.458V244.729L150.144 331L300 244.729V184.867L293.11
+  181.052L150.144 263.215L16.0766 186.334V154.643L150.144 231.524L300 145.253V86.2713L292.536
+  81.8697L150.144 163.739L22.9665 90.9663L150.144 17.8998L254.641 78.055L263.828
+  72.773V65.4371L150.144 0L0 86.2713V95.6613L150.144 181.933L283.923 104.758V136.449Z"
+/></symbol></svg>
+
+<div id="wall"></div>
+
+<!-- Provenance strip kept for errors only. The warehouse / gold-layer / load
+     lines were removed at the user's request; the panel carries the numbers. -->
+<div id="foot"><div id="err"></div></div>
+
+<div id="panel">
+  <div class="stats">
+    <div class="stat">
+      <div class="ico g">&#x25d4;</div>
+      <div class="stat-head"><span class="tag p50">P50</span><span class="stat-title">SERVING LATENCY</span></div>
+      <div class="stat-cap">median Lakehouse//RT query</div>
+      <div class="stat-val idle num" id="m-p50">&#x2014;</div>
+      <div class="stat-foot" id="m-p50-foot"></div>
+    </div>
+    <div class="stat">
+      <div class="ico a">&#x25d4;</div>
+      <div class="stat-head"><span class="tag p95">P95</span><span class="stat-title">SERVING LATENCY</span></div>
+      <div class="stat-cap">p95 Lakehouse//RT query</div>
+      <div class="stat-val idle num" id="m-p95">&#x2014;</div>
+      <div class="stat-foot" id="m-p95-foot"></div>
+    </div>
+    <div class="stat">
+      <div class="ico">&#x2197;</div>
+      <div class="stat-head"><span class="tag qps">QPS</span><span class="stat-title">SERVING THROUGHPUT</span></div>
+      <div class="stat-cap">Lakehouse//RT queries / sec</div>
+      <div class="stat-val idle num" id="m-qps">&#x2014;</div>
+      <div class="stat-foot" id="m-qps-foot"></div>
+    </div>
+  </div>
+  <div class="users">
+    <div class="ico">&#x2197;</div>
+    <div class="users-title">ACTIVE USERS</div>
+    <div class="users-cap">concurrent sessions</div>
+    <div class="users-num num" id="u-num">1</div>
+    <div class="ctl">
+      <button class="step" id="minus">&#x2212;</button>
+      <input type="range" id="slider" min="0" max="3" step="1" value="0" />
+      <button class="step" id="plus">+</button>
+      <button id="go">START</button>
+    </div>
+    <div class="ticks" id="ticks"></div>
+  </div>
+</div>
+
+<script>
+// Populated from /api/config so the ladder is defined in exactly one place
+// (server-side SCALES env). Fallback only matters if config fetch fails.
+let SCALES = [1, 10, 100, 500];
+const CARD_W = 560, CARD_H = 360;
+// Bootstrap widget set so the empty framework paints immediately, before the
+// first state poll returns. Replaced by the server's config on that poll.
+let widgets = [
+  { key: 'spend_movement', label: 'SPEND MOVEMENT',
+    caption: 'Live transaction activity', kind: 'bar', unit: 'usd' },
+  { key: 'transaction_volume', label: 'TRANSACTION VOLUME',
+    caption: 'Transactions processed by the decision stream', kind: 'bar', unit: 'count' },
+  { key: 'auto_review_rate', label: 'AUTO-REVIEW RATE',
+    caption: 'Share reviewed without finance intervention', kind: 'bar', unit: 'pct' },
+  { key: 'policy_exceptions', label: 'POLICY EXCEPTIONS',
+    caption: 'Flagged transactions requiring review', kind: 'line', unit: 'count' },
+];
+let cfg = { widget_count: 4 }, scaleIdx = 0, running = false;
+// A scale the user picked that the server has not confirmed yet (see onMetrics).
+let pendingN = null, pendingAt = 0;
+// A Start/Stop click the server has not reflected yet; drives the button label.
+let pendingAction = null, pendingActionAt = 0;
+let cards = [], paint = {}, repaintCursor = 0;
+
+const $ = id => document.getElementById(id);
+const fmt = n => n.toLocaleString('en-US');
+
+/* ---------- build the wall ---------- */
+function navHTML() {
+  return `<div class="nav">
+    <div class="side"></div>
+    <div class="brand"><svg class="mark"><use href="#db-mark"/></svg><span>databricks</span></div>
+    <div class="search">\u2315 Search data, notebooks, recents, and more\u2026<span class="kbd">\u2318 + P</span></div>
+    <div class="pill-prod">Production</div>
+    <div class="avatar">J</div>
+  </div>`;
+}
+
+function tileHTML(w) {
+  return `<div class="tile">
+    <div class="tile-head">
+      <span class="tile-label">${w.label}</span><span class="tile-cur">CURRENT</span>
+    </div>
+    <div class="tile-sub">
+      <span class="tile-cap">${w.caption}</span>
+      <span class="tile-val" data-cur>\u2014</span>
+    </div>
+    <div class="chart" data-k="${w.key}" data-kind="${w.kind}">
+      <div class="grid-lines"></div>
+      <div class="bars"></div>
+    </div>
+  </div>`;
+}
+
+function layout() {
+  const n = SCALES[scaleIdx];
+  const wall = $('wall');
+  // At small scale keep the wall clear of the control panel so a single
+  // dashboard is fully readable; at 100+ the panel overlays the wall as in the
+  // reference layout.
+  // Measure the panel rather than assuming 250px: a magic number smaller than
+  // the panel let it overlap the bottom card on a short viewport, and one larger
+  // than the viewport drove scale to the 0.02 floor (a wall of slivers). Still
+  // clamped to 45% of height and floored, so neither failure can return.
+  const availH = wall.clientHeight - 28;
+  const panel = $('panel');
+  const panelH = panel ? panel.offsetHeight + 40 : 250;   // + bottom offset & gap
+  const reserve = n <= 10 ? Math.min(panelH, Math.round(availH * 0.45)) : 0;
+  const W = wall.clientWidth - 28, H = Math.max(availH - reserve, 220);
+  const gap = n > 200 ? 4 : 10;
+
+  // pick the column count that maximises card scale
+  let best = { s: 0, cols: 1 };
+  for (let cols = 1; cols <= n; cols++) {
+    const rows = Math.ceil(n / cols);
+    const s = Math.min((W - gap * (cols - 1)) / (cols * CARD_W),
+                       (H - gap * (rows - 1)) / (rows * CARD_H));
+    if (s > best.s) best = { s, cols };
+  }
+  const s = Math.max(best.s, 0.02), cols = best.cols;
+  // 'tex' has no per-bar DOM, so a wall at that LOD never visibly updates when
+  // data arrives. 500 cards land at s~0.11, so the mid threshold must sit below
+  // that or the headline scale shows a static gradient and reads as "empty".
+  // tex is now reserved for walls beyond ~1000 cards, where per-bar DOM is the
+  // larger problem.
+  const lod = s >= 0.45 ? 'full' : (s >= 0.065 ? 'mid' : 'tex');
+
+  wall.style.gap = gap + 'px';
+  wall.style.gridTemplateColumns = `repeat(${cols}, ${CARD_W * s}px)`;
+
+  wall.innerHTML = '';
+  cards = [];
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < n; i++) {
+    const slot = document.createElement('div');
+    slot.className = 'slot';
+    slot.style.width = (CARD_W * s) + 'px';
+    slot.style.height = (CARD_H * s) + 'px';
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.style.transform = `scale(${s})`;
+    card.innerHTML = (lod === 'tex' ? '' : navHTML()) +
+      `<div class="tiles">${widgets.map(tileHTML).join('')}</div>`;
+    if (lod === 'tex') card.querySelector('.tiles').style.height = '100%';
+    slot.appendChild(card);
+    frag.appendChild(slot);
+    cards.push(card);
+  }
+  wall.appendChild(frag);
+
+  // texture LOD: drop per-bar DOM entirely, and size the stripes in card-space
+  // so they survive the transform at a legible on-screen width.
+  if (lod === 'tex') {
+    const texw = Math.max(6, 3.5 / s).toFixed(1) + 'px';
+    document.querySelectorAll('.chart').forEach(c => {
+      c.classList.add('tex');
+      c.style.setProperty('--texw', texw);
+      c.querySelector('.bars')?.remove();
+    });
+  }
+  window._lod = lod;
+  window._nbars = lod === 'full' ? 15 : 8;
+  repaintCursor = 0;
+  renderCards(true);
+}
+
+/* ---------- paint cards from published per-merchant results ---------- */
+// Card i reads paint slot (i mod slots), and each slot carries a distinct
+// merchant's rows. Previously a single series was shared by every card and
+// rotated by index, so the whole wall showed the same data and flipped in
+// unison. Returns null until that slot has real rows, so nothing is drawn
+// before START.
+function seriesFor(key, cardIdx) {
+  const slots = paint[key];
+  if (!slots || !slots.length) return null;
+  const e = slots[cardIdx % slots.length];
+  if (!e || !e.r || !e.r.length) return null;
+  return { vals: e.r.map(r => Number(r[1]) || 0), merchant: e.m };
+}
+
+function fmtCur(unit, v) {
+  if (unit === 'pct') return (v * 100).toFixed(0) + '%';
+  if (unit === 'usd') return '$' + Math.round(v).toLocaleString('en-US');
+  return Math.round(v).toLocaleString('en-US');
+}
+
+function renderCards(all) {
+  if (window._lod === 'tex') return;   // texture LOD has no per-bar DOM
+  const n = cards.length;
+  // Budget scales with the wall so a full repaint still completes in about a
+  // second at 4 pushes/sec; a flat 40 left 500 cards taking 3s+ to catch up.
+  const budget = all ? n : Math.min(n, Math.max(40, Math.ceil(n / 4)));
+  for (let k = 0; k < budget; k++) {
+    const i = all ? k : (repaintCursor + k) % n;
+    const card = cards[i];
+    card.querySelectorAll('.chart').forEach(chart => {
+      const key = chart.dataset.k;
+      const series = seriesFor(key, i);
+      const w = widgets.find(x => x.key === key);
+      const tile = chart.closest('.tile');
+      const curEl = tile.querySelector('[data-cur]');
+      const barsEl = chart.querySelector('.bars');
+      if (!barsEl) return;
+
+      // Before START there is no data: leave the frame empty rather than
+      // drawing a skeleton that could be mistaken for a measurement.
+      if (!series) {
+        if (curEl) { curEl.textContent = '\u2014'; curEl.classList.add('none'); }
+        if (barsEl.childNodes.length) barsEl.innerHTML = '';
+        return;
+      }
+      const { vals } = series;
+      if (curEl) {
+        curEl.textContent = fmtCur(w.unit, vals[vals.length - 1]);
+        curEl.classList.remove('none');
+      }
+
+      const use = vals.slice(-window._nbars);
+      const max = Math.max(...use, 1e-9);
+      if (chart.dataset.kind === 'line') {
+        const pts = use.map((v, j) =>
+          `${(j / Math.max(1, use.length - 1)) * 100},${100 - (v / max) * 82 - 9}`);
+        barsEl.innerHTML =
+          `<svg viewBox="0 0 100 100" preserveAspectRatio="none">
+             <path d="M${pts.join('L')}" vector-effect="non-scaling-stroke"/></svg>`;
+      } else {
+        barsEl.innerHTML =
+          use.map(v => `<b style="height:${Math.max(3, (v / max) * 100)}%"></b>`).join('');
+      }
+    });
+  }
+  if (!all) repaintCursor = (repaintCursor + budget) % n;
+}
+
+/* ---------- metrics ---------- */
+function setStat(el, footEl, val, unit, foot) {
+  if (val === null || val === undefined) {
+    el.textContent = '\u2014'; el.classList.add('idle');
+  } else {
+    el.classList.remove('idle');
+    el.innerHTML = `${val}<span class="u">${unit}</span>`;
+  }
+  footEl.textContent = foot || '';
+}
+
+function onMetrics(m) {
+  // Stopped: clear immediately so the wall returns to empty rather than holding
+  // rows from a finished run. Running: paint arrives only on every Nth push, so
+  // an absent payload means "keep what you have".
+  // Stopped AFTER a run (m.stopped): keep that run's last painted rows and
+  // numbers, frozen, instead of wiping the wall on Stop.
+  if (!m.running) paint = (m.stopped && m.paint) ? m.paint : {};
+  else if (m.paint) paint = m.paint;
+  running = m.running;
+  if (pendingAction === 'start' && m.running) pendingAction = null;
+  if (pendingAction === 'stop' && !m.running) pendingAction = null;
+  if (pendingAction && Date.now() - pendingActionAt > 20000) pendingAction = null;
+
+  // The server is the source of truth for how many sessions are live. Without
+  // this, opening ?users=1000 against a server already running 100 shows "1,000"
+  // above a footer reading "100 sessions". Sync without re-sending start.
+  //
+  // EXCEPT while a user change is in flight: the driver restarts a few hundred
+  // ms after the click, so the next polls still report the OLD count. Syncing to
+  // it snapped the slider back to the old setting, rebuilt the wall, then jumped
+  // forward again once the server caught up. Hold the user's choice until the
+  // server reports it (or 20 s pass, in case the restart never happened).
+  if (pendingN != null) {
+    if ((m.running && m.sessions === pendingN) || Date.now() - pendingAt > 20000) {
+      pendingN = null;
+    }
+  }
+  if (m.running && pendingN == null) {
+    const idx = SCALES.indexOf(m.sessions);
+    if (idx >= 0 && idx !== scaleIdx) { scaleIdx = idx; syncSlider(); layout(); }
+  }
+  $('go').textContent = pendingAction === 'start' ? 'STARTING…'
+    : pendingAction === 'stop' ? 'STOPPING…'
+    : (running ? 'STOP' : 'START');
+  $('go').classList.toggle('on', running);
+
+  // The engine sampler polls query history continuously, so before any run it
+  // reports latency for unrelated warehouse traffic. Only show it once this app
+  // has actually driven load.
+  const measured = m.running || m.completed > 0;
+  setStat($('m-p50'), $('m-p50-foot'), measured ? m.engine_p50 : null, 'ms',
+          measured && m.client_p50 != null ? `client ${m.client_p50} ms` : '');
+  setStat($('m-p95'), $('m-p95-foot'), measured ? m.engine_p95 : null, 'ms',
+          measured && m.client_p95 != null ? `client ${m.client_p95} ms` : '');
+  setStat($('m-qps'), $('m-qps-foot'), (running || m.stopped) ? m.qps : null, 'q/s',
+          running
+            ? `offered ${m.offered_qps} \u00b7 in-flight ${m.inflight}`
+              + (m.window_full ? '' : ' \u00b7 settling')
+            : m.stopped
+              ? `last run \u00b7 ${fmt(m.sessions)} users \u00b7 offered ${m.offered_qps}`
+              : '');
+
+  const parts = [];
+  if (m.errors) parts.push(`${m.errors} errors (${m.last_error || ''})`);
+  if (m.dropped) parts.push(`${m.dropped} dropped (in-flight ceiling)`);
+  if (m.history_error) parts.push(m.history_error);
+  $('err').textContent = parts.join(' \u00b7 ');
+
+  renderCards(false);
+}
+
+/* ---------- controls ---------- */
+function syncSlider() {
+  const el = $('slider');
+  const last = Math.max(1, SCALES.length - 1);
+  el.max = last;
+  el.value = scaleIdx;
+  el.style.setProperty('--fill', (scaleIdx / last * 100) + '%');
+  $('u-num').textContent = fmt(SCALES[scaleIdx]);
+}
+
+/* ---------- transport ----------
+   Served as a Streamlit static file and embedded as a SAME-ORIGIN iframe, so
+   this page can fetch its own state. Streamlit owns the single port and exposes
+   no custom endpoints, so the driver publishes snapshots to a JSON file next to
+   this one and we poll it.
+
+   The iframe's src never changes, so Streamlit never re-renders the iframe and
+   the wall is never rebuilt. That is the whole point: it keeps this frontend and
+   its update loop exactly as designed, instead of costing a full DOM rebuild of
+   every card on each Streamlit rerun.
+
+   Controls cannot call Python directly (that needs a compiled custom component),
+   so they set query params on the TOP window and the Streamlit script reads them
+   \u2014 the same mechanism the console already uses for navigation. */
+// ABSOLUTE path: this document is delivered via srcdoc, so a relative URL would
+// resolve against about:srcdoc and never reach the app.
+//
+// Streamlit's static handler serves every non-image file as text/plain (it
+// refuses to host HTML/JS on the app origin), which is why this page is NOT
+// loaded by iframe src \u2014 it is injected as srcdoc instead. The same restriction
+// applies to the state file, so parse the body as text rather than calling
+// r.json(), which would reject on content-type.
+const STATE_URL = '/app/static/rt_state.json';
+let pollTimer = null, missed = 0;
+
+async function poll() {
+  try {
+    const r = await fetch(`${STATE_URL}?t=${Date.now()}`, { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const s = JSON.parse(await r.text());
+    // Separate try blocks on purpose: these ran in one block, so a throw in
+    // applyConfig aborted before onMetrics and no data ever painted.
+    if (s.config) { try { applyConfig(s.config); } catch (e) {} }
+    if (s.metrics) { try { onMetrics(s.metrics); } catch (e) {} }
+    missed = 0;
+  } catch (e) {
+    // State file absent before the first run, or the app is restarting. Only
+    // complain once it has been missing long enough to be a real fault.
+    if (++missed === 40) {
+      $('err').textContent = 'state feed unavailable \u2014 is the app running?';
+    }
+  }
+}
+
+let cfgApplied = false;
+function applyConfig(c) {
+  if (cfgApplied) return;
+  cfgApplied = true;
+  cfg = c;
+  widgets = c.widgets;
+  if (Array.isArray(c.scales) && c.scales.length) SCALES = c.scales;
+  // NOTE: no warehouse/gold-layer readout any more - that strip was removed.
+  // Do not reintroduce a $('f-wh') lookup here: applyConfig runs BEFORE
+  // onMetrics inside the same try, so a null-element throw here silently
+  // swallowed the entire first poll and skipped config application.
+  $('ticks').innerHTML = SCALES.map(s => `<span>${fmt(s)}</span>`).join('');
+  // Reflect the scale the server is actually configured for.
+  const idx = SCALES.indexOf(c.sessions_selected);
+  if (idx >= 0) scaleIdx = idx;
+  syncSlider();
+  layout();
+  document.body.style.visibility = 'visible';
+}
+
+/* ---------- control channel ----------
+   Streamlit's component sandbox permits allow-same-origin but NOT top-level
+   navigation, so setting window.top.location silently did nothing and Start
+   appeared dead. Same-origin does grant parent DOM access, so controls click
+   hidden Streamlit buttons in the parent instead; Streamlit runs their on_click
+   callbacks and reruns. The component's HTML is constant, so that rerun does not
+   rebuild the wall. */
+function parentDoc() {
+  try {
+    const d = window.parent && window.parent.document;
+    return d && d !== document ? d : null;
+  } catch (e) {
+    return null;   // cross-origin: no parent access
+  }
+}
+
+function clickParentButton(marker) {
+  const d = parentDoc();
+  if (!d) return false;
+  const btns = d.querySelectorAll('button');
+  for (const b of btns) {
+    if ((b.innerText || '').trim() === marker) { b.click(); return true; }
+  }
+  return false;
+}
+
+function send(o) {
+  const marker = o.action === 'start'
+    ? `rtc:start:${SCALES[scaleIdx]}`
+    : 'rtc:stop';
+  if (clickParentButton(marker)) return;
+  // Fallback for direct (non-embedded) use.
+  const q = new URLSearchParams();
+  q.set('view', 'scale');
+  q.set('n', String(SCALES[scaleIdx]));
+  q.set('run', o.action === 'start' ? '1' : '0');
+  try { window.top.location.search = '?' + q.toString(); } catch (e) {}
+}
+
+/* ---------- fill the window ----------
+   components.html takes a FIXED pixel height, which left the wall in a short
+   box with the console's own padding around it. Same-origin parent access lets
+   the frame size itself to the viewport and drop Streamlit's block padding. */
+function fitToParent() {
+  const d = parentDoc();
+  if (!d || !window.frameElement) return;
+  if (!d.getElementById('rtw-fit')) {
+    const st = d.createElement('style');
+    st.id = 'rtw-fit';
+    st.textContent = `
+      section.main .block-container,
+      .stAppViewContainer .block-container,
+      div[data-testid="stAppViewBlockContainer"] {
+        padding: 0.4rem 0.6rem 0 !important; max-width: 100% !important;
+      }
+      div[data-testid="stIFrame"], iframe[title="st.iframe"] {
+        width: 100% !important;
+      }
+      footer, div[data-testid="stDecoration"] { display: none !important; }`;
+    d.head.appendChild(st);
+  }
+  // Hide the marker buttons. CSS cannot select on text content, so they are
+  // found by label and their Streamlit wrapper is collapsed. Done here rather
+  // than from Python for that reason.
+  d.querySelectorAll('button').forEach(b => {
+    if ((b.innerText || '').trim().startsWith('rtc:')) {
+      const box = b.closest('div[data-testid="stButton"]') || b.parentElement;
+      if (box) box.style.display = 'none';
+      b.style.display = 'none';
+    }
+  });
+
+  const top = window.frameElement.getBoundingClientRect().top;
+  const h = Math.max(560, (window.parent.innerHeight || 900) - top - 8);
+  window.frameElement.style.height = h + 'px';
+  window.frameElement.style.border = '0';
+}
+
+(function init() {
+  // Stay hidden until the server's config arrives, so a (re)mount never flashes
+  // the built-in defaults ("1 user", ticks 1/10/100/500). Fallback reveal after
+  // 3 s in case the state feed is down, so the page is never stuck blank.
+  document.body.style.visibility = 'hidden';
+  setTimeout(() => { document.body.style.visibility = 'visible'; }, 3000);
+  $('ticks').innerHTML = SCALES.map(s => `<span>${fmt(s)}</span>`).join('');
+  fitToParent();
+  syncSlider();
+  layout();
+  poll();
+  pollTimer = setInterval(poll, 250);
+  // Streamlit re-lays-out its blocks after mount, so re-fit briefly, then track
+  // the parent's resizes.
+  let fits = 0;
+  const fitTimer = setInterval(() => {
+    fitToParent();
+    if (++fits > 12) clearInterval(fitTimer);
+  }, 400);
+  try {
+    window.parent.addEventListener('resize', () => { fitToParent(); layout(); });
+  } catch (e) { /* cross-origin */ }
+
+  // Single path for every scale change. Dispatching a synthetic 'input' event
+  // from the step buttons re-read the stale slider value and reverted the change.
+  function setScale(idx) {
+    scaleIdx = Math.max(0, Math.min(SCALES.length - 1, idx));
+    syncSlider();
+    layout();
+    if (running) {
+      pendingN = SCALES[scaleIdx];
+      pendingAt = Date.now();
+      send({ action: 'start' });
+    }
+  }
+  $('slider').addEventListener('input', e => setScale(+e.target.value));
+  $('minus').onclick = () => setScale(scaleIdx - 1);
+  $('plus').onclick = () => setScale(scaleIdx + 1);
+  $('go').onclick = () => {
+    const action = running ? 'stop' : 'start';
+    pendingAction = action;
+    pendingActionAt = Date.now();
+    if (action === 'start') { pendingN = SCALES[scaleIdx]; pendingAt = Date.now(); }
+    $('go').textContent = action === 'start' ? 'STARTING…' : 'STOPPING…';
+    send({ action });
+  };
+
+  let t; addEventListener('resize', () => { clearTimeout(t); t = setTimeout(layout, 160); });
+})();
+</script>
+</body>
+</html>
