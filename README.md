@@ -99,6 +99,10 @@ Two numbers are not in the UI. **Cores busy** = q/s x executor task time (`task_
 2. For light lookups the limit is per warehouse, not executor CPU or the DBU cap. At 800 q/s each query needed ~6 ms of executor work while engine time hit ~1.2 s.
 3. For more throughput on light queries, add warehouses. Raising the DBU max helps heavier queries that need more executor work.
 
+## Data collection
+
+To improve users' experience and this asset's quality, the app reports a usage event when a page is opened. This information is captured for product improvement only, not for marketing purposes, and doesn't contain PII: the email of Databricks users is hashed, and nobody else's is sent. By using this asset, you consent to this data collection. If you wish to disable it, set the environment variable `DBDEMOS_TRACKER_DISABLED=1` (e.g. add `- name: DBDEMOS_TRACKER_DISABLED` with `value: "1"` under `config.env` in `resources/app.yml`, then redeploy).
+
 ## Repository layout
 
 ```

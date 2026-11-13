@@ -19,3 +19,4 @@ databricks-sql-connector[kernel]==4.3.0
 # TLS work costs more than the queries do. Reyden refuses Thrift, so every
 # statement is one HTTPS round trip and connection reuse is the only lever.
 httpx[http2]>=0.27,<0.29
+dbdemos-tracker==0.1.11

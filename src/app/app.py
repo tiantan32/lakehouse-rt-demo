@@ -20,6 +20,7 @@ The data is three synthetic gold tables written by the bundle's data job
 from __future__ import annotations
 
 import contextlib
+import logging
 import os
 import threading
 import time
@@ -40,6 +41,18 @@ from kernel_driver import KernelPool
 import panels
 import rt_scale
 from theme import CSS, NAV_ITEMS
+
+# Usage tracking with dbdemos-tracker (optional). Counts page views of this demo
+# so its owners can show usage. The library sends a SHA-256 hash of the viewer's
+# email only for @databricks.com users; anyone else is an anonymous view. Set
+# DBDEMOS_TRACKER_DISABLED=1 to turn it off. It never blocks or breaks a page.
+DEMO_ID = "lakehouse-rt-demo"
+Tracker = None
+if os.getenv("DBDEMOS_TRACKER_DISABLED") != "1":
+    try:
+        from dbdemos_tracker import Tracker
+    except Exception as exc:  # noqa: BLE001 - tracking is optional
+        logging.warning("dbdemos-tracker unavailable, usage tracking off: %s", exc)
 
 WAREHOUSES_PREWARMED = os.getenv("WAREHOUSES_PREWARMED", "false").lower() in {
     "1", "true", "yes",
@@ -101,6 +114,46 @@ def client() -> WorkspaceClient:
     # In Databricks Apps the service principal's credentials arrive via env vars,
     # so the default constructor authenticates with no arguments.
     return WorkspaceClient()
+
+
+@st.cache_resource(show_spinner=False)
+def _workspace_id() -> int:
+    return client().get_workspace_id()
+
+
+class _CachedWorkspace:
+    """Gives the tracker the workspace id once per process, not one API call per session."""
+
+    @staticmethod
+    def get_workspace_id() -> int:
+        return _workspace_id()
+
+
+def setup_tracking() -> None:
+    """Register the usage tracker once per browser session. Never raises."""
+    if Tracker is None or st.session_state.get("_tracker_off"):
+        return
+    try:
+        if Tracker.setup_streamlit_tracker(DEMO_ID, workspace_client=_CachedWorkspace) is None:
+            st.session_state["_tracker_off"] = True     # do not retry on every rerun
+    except Exception as exc:  # noqa: BLE001 - tracking is optional
+        logging.warning("usage tracker setup failed: %s", exc)
+        st.session_state["_tracker_off"] = True
+
+
+def track_page(path: str) -> None:
+    """One view per page entry. Reruns inside a page (button clicks) do not count again.
+
+    Fire-and-forget: the library posts from a daemon thread with a 2 s timeout.
+    """
+    if (Tracker is None or st.session_state.get("_tracker_off")
+            or st.session_state.get("_tracked_page") == path):
+        return
+    try:
+        Tracker.track_streamlit_event(path)
+        st.session_state["_tracked_page"] = path
+    except Exception as exc:  # noqa: BLE001 - tracking is optional
+        logging.warning("usage tracking failed: %s", exc)
 
 
 @st.cache_resource(show_spinner=False)
@@ -508,6 +561,7 @@ def start_background_warm() -> dict:
 
 
 def view_headtohead() -> None:
+    track_page("/headtohead")
     specs = panels.widget_specs(FACT, MONTHLY, anchor_date())
     engines = [("DBSQL Serverless", "dw", DBSQL_WAREHOUSE_ID)]
     if RT_WAREHOUSE_ID:
@@ -689,6 +743,7 @@ def _rt_set(n: int, run: bool) -> None:
 
 
 def view_scale() -> None:
+    track_page("/scale")
     if not RT_WAREHOUSE_ID:
         st.error("RT_WAREHOUSE_ID is not set. Add the Lakehouse//RT warehouse as an app resource.")
         return
@@ -789,6 +844,7 @@ def view_scale() -> None:
 # Architecture
 # --------------------------------------------------------------------------- #
 def view_architecture() -> None:
+    track_page("/architecture")
     eyebrow("Architecture")
     st.title("Lakehouse RT Demo")
     st.caption(
@@ -863,6 +919,7 @@ def view_architecture() -> None:
 
 # --------------------------------------------------------------------------- #
 def main() -> None:
+    setup_tracking()
     st.markdown(CSS, unsafe_allow_html=True)
 
     valid = [k for k, _ in NAV_ITEMS]
