@@ -22,8 +22,8 @@ resources:
 
       # Replaces app.yaml, so catalog and schema come from bundle variables.
       config:
-        # The Python supervisor prewarms both warehouses, starts Streamlit on
-        # DATABRICKS_APP_PORT, runs keepalives and forwards shutdown signals.
+        # The Python supervisor starts Streamlit on DATABRICKS_APP_PORT, runs
+        # the warehouse watchdog and forwards shutdown signals.
         command: ["python", "warehouse_keeper.py", "--serve"]
         env:
           # The proxy origin (*.databricksapps.com) differs from the workspace
@@ -42,11 +42,13 @@ resources:
             value: ${var.catalog}
           - name: DEMO_SCHEMA
             value: ${var.schema}
-          # The keeper warms both engines before Streamlit serves and touches
-          # them below their auto-stop intervals, so both warehouses stay
-          # running (and billable) while the app is running.
-          - name: WAREHOUSES_PREWARMED
-            value: "true"
+          # Warehouse watchdog (warehouse_keeper.py). Nothing runs at boot: the
+          # warehouses start on Pre-warm or on a measurement, stay warm while
+          # the demo is used (a touch every KEEPALIVE seconds), and are stopped
+          # after IDLE_STOP minutes without a click, unless someone else ran a
+          # query on them in that window.
+          - name: WAREHOUSE_IDLE_STOP_MINUTES
+            value: "20"
           - name: WAREHOUSE_KEEPALIVE_SECONDS
             value: "180"
           # Scaled-load refresh. 10 s: 1,000 users offer 400 q/s.

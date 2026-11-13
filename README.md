@@ -42,7 +42,22 @@ Browser
 2. Deploy: `databricks bundle deploy -p <profile>`
 3. Generate the data and grant the app read access (about 5 to 10 minutes): `databricks bundle run generate_data -p <profile>`
 4. Start the app: `databricks bundle run lakehouse_rt_demo -p <profile>`
-5. Before each demo: `scripts/warmup.sh <profile>`
+5. Before each demo, press **Pre-warm** in the app (top right), about a minute ahead.
+
+## Warehouse controls
+
+The app stays live without keeping compute on. The top right of every page shows both warehouses' state and two buttons:
+
+- **Pre-warm** starts both warehouses, waits for RUNNING and fills their disk cache with the head-to-head queries, so the first click is not a cold start.
+- **Turn off** stops both warehouses now (and any Scaled load run). It also ends anyone else's queries on them.
+
+A watchdog inside the app (`warehouse_keeper.py`) does the work:
+
+1. While the demo is in use (a click within the idle window, or a Scaled load run), it runs `SELECT 1` on running warehouses every 3 minutes so their own auto-stop does not fire mid-demo.
+2. After `WAREHOUSE_IDLE_STOP_MINUTES` (default 20) without a click, it stops each running warehouse, unless someone other than the app ran a query on it in that window. These can be shared warehouses, and their own auto-stop covers that case.
+3. Checking state is a control-plane call, not a query, so watching never keeps a warehouse awake. Opening a page starts nothing; only Pre-warm, Run and Start do.
+
+Change the limits in `resources/app.yml` (`WAREHOUSE_IDLE_STOP_MINUTES`, `WAREHOUSE_KEEPALIVE_SECONDS`) and redeploy. `scripts/warmup.sh` still works from a laptop.
 
 The data job writes data that ends on the day it runs. The app anchors every time window on the newest date in the data, so the widgets stay populated weeks later. Rerun the job to refresh the dates.
 
@@ -115,7 +130,8 @@ src/app/                       Streamlit app
   app.py                       views: architecture, head to head, scaled load
   rt_scale.py                  open-loop scaled-load driver and engine-time sampler
   static/rt_scale.html         scaled-load frontend (polls static/rt_state.json)
-  warehouse_keeper.py          prewarms warehouses, then starts Streamlit
+  warehouse_keeper.py          starts Streamlit and runs the warehouse watchdog
+  warehouse_control.py         command, activity and status files shared by the app and watchdog
   kernel_driver.py             persistent use_kernel sessions for head to head
 perf/rt_scale_job.py           the same workload as a multi-process job
 scripts/warmup.sh              pre-demo warm-up

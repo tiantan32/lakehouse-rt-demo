@@ -22,7 +22,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
-import threading
 import time
 import uuid
 from concurrent.futures import wait
@@ -40,7 +39,8 @@ from demo_config import (CATALOG, DBSQL_WAREHOUSE_ID, EVENTS, FACT, MONTHLY,
 from kernel_driver import KernelPool
 import panels
 import rt_scale
-from theme import CSS, NAV_ITEMS
+import warehouse_control as control
+from theme import C, CSS, MONO as MONO_FONT, NAV_ITEMS
 
 # Usage tracking with dbdemos-tracker (optional). Counts page views of this demo
 # so its owners can show usage. The library sends a SHA-256 hash of the viewer's
@@ -54,9 +54,6 @@ if os.getenv("DBDEMOS_TRACKER_DISABLED") != "1":
     except Exception as exc:  # noqa: BLE001 - tracking is optional
         logging.warning("dbdemos-tracker unavailable, usage tracking off: %s", exc)
 
-WAREHOUSES_PREWARMED = os.getenv("WAREHOUSES_PREWARMED", "false").lower() in {
-    "1", "true", "yes",
-}
 
 # Scaled load: the ladder the slider exposes. Offered rate = sessions x 4 widgets
 # / refresh. At 10 s, 1,000 users offer 400 q/s, the measured healthy point on a
@@ -81,10 +78,12 @@ st.set_page_config(page_title="Lakehouse RT Demo", page_icon="⚡", layout="wide
 # are consumed exactly once, so no stale click can survive.
 # --------------------------------------------------------------------------- #
 def _nav_to(key: str) -> None:
+    control.touch_activity("nav")
     st.query_params["view"] = key
 
 
 def _h2h_start() -> None:
+    control.touch_activity("headtohead")
     st.session_state.pop("h2h", None)
     st.session_state["h2h_run"] = True
     # Run whatever is on stage; do NOT force both engines into view. Forcing it
@@ -159,7 +158,9 @@ def track_page(path: str) -> None:
 @st.cache_resource(show_spinner=False)
 def anchor_date():
     """Last date in the synthetic data. Time-windowed widgets filter from here."""
-    return demo_config.resolve_anchor(client(), DBSQL_WAREHOUSE_ID or RT_WAREHOUSE_ID)
+    # No warehouse id: read the table property only, so a page view never
+    # starts a warehouse. Missing property means today.
+    return demo_config.resolve_anchor(client())
 
 
 @st.cache_resource(show_spinner=False)
@@ -509,57 +510,6 @@ def _load_both_live(engines, slots, specs, warmup: bool = False) -> dict:
             for _, k, _ in engines}
 
 
-# --------------------------------------------------------------------------- #
-# Background warm-up, fired once per app process on first page render.
-#
-# Both warehouses auto-stop when idle (RT 5 min, DBSQL 10 min), so a demo almost
-# always opens onto stopped compute. Starting them the moment the app is opened
-# means they are usually RUNNING and disk-warm by the time anyone presses a
-# button, and no banner is needed to say so.
-#
-# @st.cache_resource makes this run ONCE per process rather than once per session
-# or per rerun. The thread touches only run_sql and the SDK -- never st.* -- so it
-# needs no ScriptRunContext.
-# --------------------------------------------------------------------------- #
-def _warm_queries() -> list[str]:
-    """Cheap touches that fill the disk cache for what every view reads."""
-    return [
-        f"SELECT COUNT(*) FROM {FACT}",
-        f"SELECT dispute_case_id FROM {FACT} WHERE merchant_id = 100001 LIMIT 1",
-        f"SELECT COUNT(*) FROM {FACT} WHERE NOT is_closed AND days_to_deadline <= 5",
-        f"SELECT COUNT(*) FROM {MONTHLY}",
-    ]
-
-
-@st.cache_resource(show_spinner=False)
-def start_background_warm() -> dict:
-    """Kick off warehouse start + cache fill in a daemon thread. Returns its state."""
-    state: dict = {"began": time.time(), "running": True, "ok": None, "detail": {}}
-
-    def work() -> None:
-        try:
-            wids = [w for w in (DBSQL_WAREHOUSE_ID, RT_WAREHOUSE_ID) if w]
-            ok, detail = ensure_warm(wids)          # no slot: silent
-            state["ok"], state["detail"] = ok, detail
-            if ok:
-                for wid in wids:
-                    for q in _warm_queries():
-                        try:
-                            run_sql(cache_bust(q), wid)
-                        except Exception:  # noqa: BLE001
-                            pass
-        except Exception as e:  # noqa: BLE001
-            state["error"] = str(e)
-        finally:
-            state["running"] = False
-            state["finished"] = time.time()
-
-    t = threading.Thread(target=work, name="demo-warmup", daemon=True)
-    t.start()
-    state["thread"] = t
-    return state
-
-
 def view_headtohead() -> None:
     track_page("/headtohead")
     specs = panels.widget_specs(FACT, MONTHLY, anchor_date())
@@ -610,7 +560,8 @@ def view_headtohead() -> None:
                 unsafe_allow_html=True)
     if st.session_state.pop("h2h_run", False):
         live = [(n, k, w) for n, k, w in engines[:shown] if w]
-        if not WAREHOUSES_PREWARMED:
+        prewarmed = _prewarmed()
+        if not prewarmed:
             for name, kind, wid in live:
                 slots[kind].markdown(
                     panels.window(name, kind, "WARMING", None, _tiles_for(specs, {}, kind)),
@@ -622,12 +573,12 @@ def view_headtohead() -> None:
                 "Not all warehouses reached RUNNING, so the comparison would measure "
                 "start-up rather than the engines: "
                 + " · ".join(f"{k}: {v}" for k, v in states.items())
-                + ". Run `scripts/warmup.sh` and try again.")
+                + ". Press Pre-warm and try again.")
             return
-        # Deployed apps pre-start both warehouses and warm these exact dashboard
-        # queries before Streamlit accepts traffic. Keep the two-pass fallback for
-        # local development, where the startup keeper is not running.
-        if not WAREHOUSES_PREWARMED:
+        # Pre-warm runs these exact dashboard queries on both warehouses. Without
+        # it (warehouses started by this click, or a local run), two discarded
+        # passes fill the disk cache so start-up is never measured.
+        if not prewarmed:
             for _ in range(2):
                 _load_both_live(live, slots, specs, warmup=True)
         results = _load_both_live(live, slots, specs)
@@ -683,7 +634,7 @@ def view_headtohead() -> None:
 | **Panel headline** | Client wall-clock end-to-end, measured inside the app container over persistent `use_kernel=True` sessions. Counts up only during the measured pass, never decreases, and freezes on its own last tick. |
 | **Engine time** | Server-side duration from query history, below the panels, accepted only once `is_final` is true. Lower than the headline because it excludes the network and SDK time both engines pay equally. |
 | **Result cache** | Disabled on every persistent DBSQL session with `use_cached_result=false`. Both engines also receive the same byte-for-byte SQL with a fresh `/* nocache=<uuid> */` comment. Lakehouse//RT has no result cache. |
-| **Disk cache** | Warm on both engines: the app-start keeper runs these queries before Streamlit serves. Local development falls back to two discarded passes. |
+| **Disk cache** | Warm on both engines. Pre-warm runs these exact queries on both warehouses; without it, two discarded passes run first. |
 | **Warehouses** | Size both the same (for example both Small), so the comparison is not a sizing artifact. |
 | **Layout** | Liquid-clustered on `merchant_id, chargeback_filing_date`, with OPTIMIZE run. Clustering is only metadata until OPTIMIZE runs. |
 
@@ -738,6 +689,8 @@ def _scale_config(selected: int) -> dict:
 # wall.
 # --------------------------------------------------------------------------- #
 def _rt_set(n: int, run: bool) -> None:
+    if run:
+        control.touch_activity("scale")
     st.session_state["rt_n"] = n
     st.session_state["rt_run"] = run
 
@@ -809,19 +762,17 @@ def view_scale() -> None:
     components.html(rt_scale.frontend_html(), height=1400, scrolling=False)
 
     if want_run and not (driver.running and driver.sessions == want_n):
-        # Gate on RUNNING before measuring, the same way head to head does. The
-        # keeper warms both warehouses before Streamlit serves and touches them
-        # every few minutes, so this is normally a no-op. It matters in the window
-        # after the workspace idle guard stops RT: without the gate, warehouse
-        # start-up lands inside the first cycle's client latency and the headline
-        # reads as an engine problem.
+        # Gate on RUNNING before measuring, the same way head to head does. After
+        # Pre-warm this is a no-op. Otherwise it starts RT here: without the gate,
+        # warehouse start-up lands inside the first cycle's client latency and the
+        # headline reads as an engine problem.
         ok, states = ensure_warm([RT_WAREHOUSE_ID])
         if not ok:
             st.error(
                 "Lakehouse//RT did not reach RUNNING, so this would measure "
                 "start-up rather than serving latency: "
                 + " / ".join(f"{k}: {v}" for k, v in states.items())
-                + ". Run scripts/warmup.sh and try again."
+                + ". Press Pre-warm and try again."
             )
             return
         driver.start(want_n, SCALE_REFRESH_S)
@@ -918,6 +869,104 @@ def view_architecture() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Warehouse controls, on every page.
+#
+# The buttons only queue a command; the watchdog in warehouse_keeper.py starts,
+# warms and stops the warehouses, and turns them off after the idle limit. The
+# bar is a fragment that refreshes itself every few seconds, so its reruns and
+# button clicks never rerun the page (and never remount the Scaled load wall).
+# --------------------------------------------------------------------------- #
+_PHASES = {
+    "warm": ("Warm", C["p50"]),
+    "running": ("Running", C["p50"]),
+    "starting": ("Starting", C["p95"]),
+    "warming": ("Warming cache", C["p95"]),
+    "stopping": ("Stopping", C["p95"]),
+    "partial": ("Partly on", C["p95"]),
+    "off": ("Off", C["dim"]),
+    "unknown": ("Unknown", C["dim"]),
+}
+
+
+def _prewarmed() -> bool:
+    s = control.read_status()
+    return bool(s and s.get("warm"))
+
+
+def _wh_warm() -> None:
+    control.touch_activity("prewarm")
+    st.session_state["_wh_pending"] = control.send_command("warm")
+
+
+def _wh_off() -> None:
+    # A live scaled-load run would start RT again on its next statement.
+    st.session_state["rt_run"] = False
+    if RT_WAREHOUSE_ID:
+        with contextlib.suppress(Exception):
+            scale_driver(RT_WAREHOUSE_ID).reset()
+    st.session_state["_wh_pending"] = control.send_command("stop")
+
+
+@st.fragment(run_every=4)
+def warehouse_bar() -> None:
+    s = control.read_status()
+    pending = st.session_state.get("_wh_pending")
+    if pending and s and s.get("handled") == pending:
+        st.session_state.pop("_wh_pending", None)
+        pending = None
+    info, warm_col, off_col = st.columns([3.4, 1.2, 1.2], gap="small")
+
+    if s is None:
+        info.markdown(
+            f'<div style="font-size:.74rem;color:{C["dim"]};padding-top:.45rem">'
+            "Warehouse watchdog is not running here, so the controls are off.</div>",
+            unsafe_allow_html=True)
+        warm_col.button("Pre-warm", key="wh_warm", disabled=True, use_container_width=True)
+        off_col.button("Turn off", key="wh_off", disabled=True, use_container_width=True)
+        return
+
+    phase = s.get("phase", "unknown")
+    label, col = _PHASES.get(phase, _PHASES["unknown"])
+    chips = " ".join(
+        f'<span style="color:{C["p50"] if w["state"] == "RUNNING" else C["muted"]}">'
+        f'{"RT" if w["id"] == RT_WAREHOUSE_ID else "DBSQL"} {w["state"].lower()}</span>'
+        for w in s.get("warehouses", []))
+    if pending:
+        detail = "request sent, waiting for the watchdog"
+    elif phase in ("warm", "running", "partial"):
+        left = (s.get("idle_stop_s") or 0) - (s.get("idle_for_s") or 0)
+        detail = (f"auto-off in {max(1, round(left / 60))} min if idle" if left > 0
+                  else "auto-off check due")
+        if s.get("kept_on"):
+            detail = "left on: someone else is using it"
+    elif phase == "off":
+        detail = "press Pre-warm about a minute before demoing"
+    else:
+        detail = s.get("note") or ""
+    if str(s.get("note", "")).startswith("pre-warm failed"):
+        detail = s["note"][:120]
+    info.markdown(
+        f'<div style="font-size:.74rem;line-height:1.25;padding-top:.15rem">'
+        f'<span style="color:{C["muted"]};letter-spacing:.12em;font-weight:700">WAREHOUSES</span> '
+        f'<span style="color:{col};font-weight:700">&#9679; {label}</span><br>'
+        f'<span style="font-family:{MONO_FONT}">{chips}</span> '
+        f'<span style="color:{C["dim"]}">&middot; {detail}</span></div>',
+        unsafe_allow_html=True)
+
+    busy = bool(pending) or phase in ("starting", "warming", "stopping")
+    mins = int((s.get("idle_stop_s") or 0) // 60)
+    warm_col.button(
+        "Pre-warm", key="wh_warm", on_click=_wh_warm, use_container_width=True,
+        disabled=busy or phase == "warm",
+        help=f"Start both warehouses and fill their disk cache (about a minute). They "
+             f"stay warm while the demo is used and turn off after {mins} min idle.")
+    off_col.button(
+        "Turn off", key="wh_off", on_click=_wh_off, use_container_width=True,
+        disabled=busy or phase == "off",
+        help="Stop both warehouses now. This also ends anyone else's queries on them.")
+
+
+# --------------------------------------------------------------------------- #
 def main() -> None:
     setup_tracking()
     st.markdown(CSS, unsafe_allow_html=True)
@@ -930,21 +979,18 @@ def main() -> None:
     # Navigation uses real buttons. HTML anchors (`<a href="?view=...">`) render
     # inside st.markdown but do not reliably navigate in Streamlit, which left the
     # pills looking clickable and doing nothing.
-    nav_cols = st.columns([1, 1, 1, 5], gap="small")
+    nav_cols = st.columns([1, 1, 1, 0.3, 5.2], gap="small")
     for col, (key, label) in zip(nav_cols, NAV_ITEMS):
         col.button(label, key=f"nav_{key}", use_container_width=True,
                    type="primary" if key == view else "secondary",
                    on_click=_nav_to, args=(key,), disabled=(key == view))
+    with nav_cols[4]:
+        warehouse_bar()
     st.markdown("")
 
     if not DBSQL_WAREHOUSE_ID and not RT_WAREHOUSE_ID:
         st.error("No warehouse configured. Add them as app resources.")
         return
-
-    # The app command starts a process-level keeper before Streamlit accepts traffic.
-    # Retain the in-process fallback for local development.
-    if not WAREHOUSES_PREWARMED:
-        start_background_warm()
 
     # Leaving Scaled load stops its run and forgets the result (see view_scale).
     if view != "scale" and st.session_state.pop("_rt_in_scale", False) and RT_WAREHOUSE_ID:

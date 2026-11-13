@@ -196,6 +196,13 @@ GROUP BY merchant_id, filing_year_month
 for t in ("gold_dispute_case_fact", "gold_dispute_event_stream", "gold_merchant_dispute_monthly"):
     sql(f"OPTIMIZE {S}.{t}")
 
+# The app reads this through the Unity Catalog API, so finding the anchor date
+# never needs a running warehouse (demo_config.resolve_anchor).
+sql(f"""
+ALTER TABLE {S}.gold_dispute_case_fact SET TBLPROPERTIES (
+  'demo.anchor_date' = '{spark.sql(f"SELECT CAST(MAX(chargeback_filing_date) AS STRING) FROM {S}.gold_dispute_case_fact").first()[0]}')
+""")
+
 if APP_SP:
     # The app runs as its own service principal. Bundle app resources grant
     # warehouse access only; Unity Catalog read access is separate.
